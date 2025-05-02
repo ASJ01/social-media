@@ -42,16 +42,13 @@ def callback():
         "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET
-    }
+        }
     response = requests.post(token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
     token_info = response.json()
 
     access_token = token_info.get("access_token")
-    if not access_token:
-        return "Failed to get access token", 400
-
     session["access_token"] = access_token
-    return redirect("/post")
+
 
 
 @app.route("/post", methods=["GET", "POST"])
@@ -95,7 +92,6 @@ def post_to_linkedin():
             return f"Failed to post: {post_response.text}", 400
 
     return render_template("post.html")
-
 
 if __name__ == "__main__":
     app.run(debug=True)
