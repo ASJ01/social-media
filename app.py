@@ -1,97 +1,129 @@
 import os
-import requests
-from flask import Flask, redirect, request, session, render_template
+import random
+import string
+from flask import Flask, request, jsonify, redirect, render_template, send_from_directory
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app = Flask(__name__, static_folder='static')
+pending_posts = {}
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
+# LinkedIn credentials
+LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
+LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:5000/auth/linkedin/callback")
 
-
-@app.route("/")
+@app.route('/')
 def home():
-    return '<a href="/login">Link your LinkedIn account</a>'
+    return render_template('index.html')
 
+@app.route('/api/linkedin/auth', methods=['POST'])
+def linkedin_auth():
+    content = request.json.get('content')
+    state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    pending_posts[state] = content
 
-@app.route("/login")
-def login():
+    scopes = "openid profile w_member_social email"
     auth_url = (
-        "https://www.linkedin.com/oauth/v2/authorization"
+        f"https://www.linkedin.com/oauth/v2/authorization"
         f"?response_type=code"
-        f"&client_id={CLIENT_ID}"
+        f"&client_id={LINKEDIN_CLIENT_ID}"
         f"&redirect_uri={REDIRECT_URI}"
-        f"&scope=r_liteprofile%20w_member_social"
+        f"&scope={scopes}"
+        f"&state={state}"
     )
-    return redirect(auth_url)
 
+    return jsonify({'authUrl': auth_url})
 
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
+@app.route('/auth/linkedin/callback')
+def linkedin_callback():
+    code = request.args.get('code')
+    state = request.args.get('state')
+    error = request.args.get('error')
+    error_description = request.args.get('error_description')
 
-    # Exchange code for access token
-    token_url = "https://www.linkedin.com/oauth/v2/accessToken"
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET
-        }
-    response = requests.post(token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    token_info = response.json()
+    if error:
+        return f"""
+            <script>
+                window.opener.postMessage({{ error: '{error}', errorDescription: '{error_description}' }}, '*');
+                window.close();
+            </script>
+        """
 
-    access_token = token_info.get("access_token")
-    session["access_token"] = access_token
+    if not code or not state:
+        return "Missing code or state", 400
 
+    content = pending_posts.pop(state, None)
+    if not content:
+        return "Invalid state or expired session", 400
 
+    try:
+        token_response = requests.post(
+            "https://www.linkedin.com/oauth/v2/accessToken",
+            data={
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': REDIRECT_URI,
+                'client_id': LINKEDIN_CLIENT_ID,
+                'client_secret': LINKEDIN_CLIENT_SECRET
+            },
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        ).json()
 
-@app.route("/post", methods=["GET", "POST"])
-def post_to_linkedin():
-    access_token = session.get("access_token")
-    if not access_token:
-        return redirect("/login")
+        access_token = token_response.get('access_token')
+        if not access_token:
+            raise Exception("No access token received")
 
-    # Get user URN (ID)
-    profile_url = "https://api.linkedin.com/v2/me"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    profile_response = requests.get(profile_url, headers=headers)
-    profile_data = profile_response.json()
-    urn = profile_data.get("id")
+        profile_response = requests.get(
+            "https://api.linkedin.com/v2/userinfo",
+            headers={
+                'Authorization': f'Bearer {access_token}',
+                'X-Restli-Protocol-Version': '2.0.0'
+            }
+        ).json()
 
-    if request.method == "POST":
-        message = request.form.get("message")
+        user_urn = f"urn:li:person:{profile_response['sub']}"
 
         post_data = {
-            "author": f"urn:li:person:{urn}",
+            "author": user_urn,
             "lifecycleState": "PUBLISHED",
             "specificContent": {
                 "com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": message},
+                    "shareCommentary": {"text": content},
                     "shareMediaCategory": "NONE"
                 }
             },
-            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}
+            "visibility": {
+                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+            }
         }
 
-        post_url = "https://api.linkedin.com/v2/ugcPosts"
-        post_response = requests.post(post_url, json=post_data, headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "X-Restli-Protocol-Version": "2.0.0"
-        })
+        post_response = requests.post(
+            "https://api.linkedin.com/v2/ugcPosts",
+            headers={
+                'Authorization': f'Bearer {access_token}',
+                'X-Restli-Protocol-Version': '2.0.0',
+                'Content-Type': 'application/json'
+            },
+            json=post_data
+        ).json()
 
-        if post_response.status_code == 201:
-            return "Post successfully published to LinkedIn!"
-        else:
-            return f"Failed to post: {post_response.text}", 400
+        return f"""
+            <script>
+                window.opener.postMessage({{ success: true, postId: '{post_response.get('id', '')}' }}, '*');
+                window.close();
+            </script>
+        """
 
-    return render_template("post.html")
+    except Exception as e:
+        return f"""
+            <script>
+                window.opener.postMessage({{ error: 'server_error', errorDescription: '{str(e)}' }}, '*');
+                window.close();
+            </script>
+        """
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(debug=True)
